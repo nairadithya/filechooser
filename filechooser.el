@@ -703,7 +703,29 @@ buffer.  FILTERS are used to restrict selection to a subset of files."
   (when-let ((bytes (caar (alist-get name opts nil nil #'equal))))
     (dbus-byte-array-to-string (if (equal (car (last bytes)) 0) (butlast bytes) bytes))))
 
-(defun filechooser-handle-open-file (_handle _app_id _parent title &rest opts)
+(defun filechooser--prompt (action app-id title)
+  "Format ACTION using APP-ID or the application suffix of TITLE."
+  (let* ((safe-id (and (stringp app-id)
+                       (string-match-p "\\`[[:alnum:]_][[:alnum:]_.-]*\\'" app-id)
+                       app-id))
+         (desktop-name
+          (and safe-id
+               (condition-case nil
+                   (let ((file (locate-file (concat safe-id ".desktop")
+                                            (mapcar (lambda (dir) (expand-file-name "applications" dir))
+                                                    (cons (xdg-data-home) (xdg-data-dirs))))))
+                     (when file (gethash "Name" (xdg-desktop-read-file file))))
+                 (error nil))))
+         (desktop-name (and (stringp desktop-name) (string-trim desktop-name)))
+         (suffix (and (stringp title)
+                      (string-match ".*[[:space:]][-–—][[:space:]]+\\([^–—]+\\)\\'" title)
+                      (string-trim (match-string 1 title))))
+         (app (or (and desktop-name (not (string-empty-p desktop-name)) desktop-name)
+                  (and suffix (not (string-empty-p suffix)) suffix)
+                  safe-id)))
+    (concat action (if app (format " [%s]" app) "") ": ")))
+
+(defun filechooser-handle-open-file (_handle app-id _parent title &rest opts)
   "Handle OpenFile request with prompt TITLE and options OPTS."
   (setq opts (or (plist-get opts :array) (car opts)))
   (let* ((filters (filechooser--make-filters opts))
@@ -713,10 +735,13 @@ buffer.  FILTERS are used to restrict selection to a subset of files."
          (dir (filechooser--option-path opts "current_folder"))
          (dir (and dir (file-name-as-directory dir)))
          (chooser (if multiple filechooser-choose-files filechooser-choose-file))
+         (prompt (filechooser--prompt (if (eq filechooser--request-kind 'directory)
+                                          "Select folder" "Open file")
+                                      app-id title))
          (result (progn
                    (setq filechooser-current-operation chooser)
-                   (if multiple (funcall chooser (format "%s: " title) dir filters)
-                     (funcall chooser (format "%s: " title) dir filters t))))
+                   (if multiple (funcall chooser prompt dir filters)
+                     (funcall chooser prompt dir filters t))))
          (names (ensure-list result)))
     (cond ((null result) (filechooser--return-value nil))
           ((or (not (listp names))
@@ -725,7 +750,7 @@ buffer.  FILTERS are used to restrict selection to a subset of files."
            '(2 (:array :signature "{sv}")))
           (t (filechooser--return-value names)))))
 
-(defun filechooser-handle-save-file (_handle _app_id _parent title &rest opts)
+(defun filechooser-handle-save-file (_handle app-id _parent title &rest opts)
   "Handle SaveFile request with prompt TITLE and options OPTS."
   (setq opts (or (plist-get opts :array) (car opts)))
   (setq filechooser-current-operation filechooser-choose-file)
@@ -735,18 +760,18 @@ buffer.  FILTERS are used to restrict selection to a subset of files."
          (name (or (caar (alist-get "current_name" opts nil nil #'equal))
                    (and current-file (file-name-nondirectory current-file)))))
     (filechooser--return-value
-     (funcall filechooser-choose-file (format "%s: " title)
+     (funcall filechooser-choose-file (filechooser--prompt "Save file" app-id title)
               (and folder (file-name-as-directory folder))
               (filechooser--make-filters opts) nil name))))
 
-(defun filechooser-handle-save-files (_handle _app_id _parent title &rest opts)
+(defun filechooser-handle-save-files (_handle app-id _parent title &rest opts)
   "Handle SaveFiles request with prompt TITLE and options OPTS."
   (setq opts (or (plist-get opts :array) (car opts)))
   (setq filechooser-current-operation filechooser-choose-directory)
   (filechooser--return-value
    (funcall
     filechooser-choose-directory
-    (format "%s: " title)
+    (filechooser--prompt "Save files" app-id title)
     (dbus-byte-array-to-string
      (butlast (caar (alist-get "current_folder" opts nil nil #'equal))))
     (mapcar (lambda (file) (dbus-byte-array-to-string (butlast file)))

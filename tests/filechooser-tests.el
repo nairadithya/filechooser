@@ -307,3 +307,41 @@
       (fc-test-dired root (lambda ()
         (with-current-buffer other (dired-goto-file nested) (dired-mark 1))
         (goto-char (point-min)) nil))))))
+
+(ert-deftest filechooser-handler-captions ()
+  (let* ((root (make-temp-file "filechooser-desktop-" t))
+         (process-environment (copy-sequence process-environment))
+         (apps (expand-file-name "applications" root))
+         prompts
+         (filechooser-choose-file (lambda (prompt &rest _) (push prompt prompts) nil))
+         (filechooser-choose-files (lambda (prompt &rest _) (push prompt prompts) nil))
+         (filechooser-choose-directory (lambda (prompt &rest _) (push prompt prompts) nil)))
+    (unwind-protect
+        (progn
+          (setenv "XDG_DATA_HOME" root)
+          (setenv "XDG_DATA_DIRS" root)
+          (make-directory apps)
+          (write-region "[Desktop Entry]\nName=Zen Browser\n" nil
+                        (expand-file-name "zen.desktop" apps) nil 'silent)
+          (filechooser-handle-open-file nil "zen" nil "Open File - Some page – Other")
+          (filechooser-handle-save-file nil "zen" nil "Some page")
+          (filechooser-handle-save-files nil "zen" nil "Some page"
+                                         `(("current_folder" (,(fc-test-bytes root))) ("files" (nil))))
+          (filechooser-handle-open-file nil "" nil "Open File - Page – Zen Browser")
+          (filechooser-handle-open-file nil "" nil "Open File")
+          (filechooser-handle-open-file nil "missing" nil "Open File")
+          (filechooser-handle-open-file nil "../bad" nil "Open File")
+          (filechooser-handle-open-file nil "" nil "Open File" '(("directory" (t))))
+          (should (equal (nreverse prompts)
+                         '("Open file [Zen Browser]: " "Save file [Zen Browser]: "
+                           "Save files [Zen Browser]: " "Open file [Zen Browser]: "
+                           "Open file: " "Open file [missing]: " "Open file: "
+                           "Select folder: "))))
+      (delete-directory root t))))
+
+(ert-deftest filechooser-caption-ignores-desktop-read-errors ()
+  (cl-letf (((symbol-function 'xdg-data-home) (lambda () (error "unavailable"))))
+    (let* (prompt
+          (filechooser-choose-file (lambda (caption &rest _) (setq prompt caption) nil)))
+      (filechooser-handle-open-file nil "missing" nil "Open")
+      (should (equal prompt "Open file [missing]: ")))))
