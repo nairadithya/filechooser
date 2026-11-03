@@ -29,7 +29,7 @@ so that the frame filechooser uses appears above tiling windows.
 
 5. In my opinion minor compared to these is the fact the filechooser dialogues are not modal, i.e. you can still freely interact with the window that sent the file selection request.
 
-6. Although `OpenFile` and `SaveFile` methods have been tested by me, `SaveFiles` method is completely untested since I don't know a way to trigger it.
+6. The test suite exercises `OpenFile`, `SaveFile`, and `SaveFiles`. Browser-specific behavior still needs application testing.
 
 ## Installation
 If despite these limitations you want to test the package you can use one of the following options:
@@ -119,7 +119,7 @@ The only builtin alternative to default values is `filechooser-with-dired`. You 
 ```emacs-lisp
 (setq filechooser-choose-files #'filechooser-with-dired)
 ```
-to change to a dired based selection for multiple files. In this mode the file chooser frame will have a dired buffer selected. To select files navigate to the desired directory. Mark the files to be selected and press `C-c C-c` to finish. `C-c C-k` aborts the selection process. Filters are available in this mode too and can be changed using `C-f`.
+to select multiple files with Dired. `RET` enters a directory. On a file, it accepts the marked files, or the file at point when nothing is marked. It does not open the file in Emacs. `C-c C-c` also accepts the marked files or the file at point. For folder requests, it accepts the directory at point or the current directory when point is on the header. `C-c C-k` cancels. `C-f` changes filters. Directories remain visible under file filters so you can navigate into them.
 
 ### Keybinds
 If you want to use some commands during file selection you can them on `filechooser-mininuffer-map`. For binding a command only during multiple file selection use `filechooser-multiple-selection-map`.
@@ -144,3 +144,20 @@ If you have some suggestions for improvement, please file a bug report or even b
 2. An auto start mechanism that starts an emacsclient and use it if Emacs or server are not running.
 ## More on limitations
 Originally I wanted to write a portal which acted as a global minor mode i.e a user would run `M-x filechooser-mode` and Emacs would take over file selection dialogues. User would run `M-x filechooser-mode` again and Emacs would no longer meddle with these dialogues. However this seems not be possible. [xdg-desktop-portal does not allow user specific portal definitions](https://github.com/flatpak/xdg-desktop-portal/issues/804), as a result to place the `emacs.portal` file in the correct location root access is required. Once that file is placed and `xdg-desktop-portal` restarted, only Emacs can be used for `filechooser` interface. If Emacs doesn't claim the `dbus` service required, no file selection dialogues will appear and no error will be raised either (at least `firefox` fails completely silently) since there is no fallback mechanism to use a working service if the first one couldn't be started.
+
+### Tests
+
+Run `make test` with Emacs and the `compat` package installed. If `compat` is
+not in the default package directory, set `COMPAT` to its source directory:
+
+```sh
+make test COMPAT=/path/to/compat
+```
+
+Run the interactive transport checks on Linux with `make verify-portal`.
+Install Python 3 with PyGObject, GLib, and `dbus-run-session` first.
+Set `COMPAT` if the package is outside your normal package directories.
+The checks launch an isolated terminal Emacs on a private D-Bus session.
+They send real portal backend calls and drive the Emacs command loop without
+replacing `recursive-edit` or the minibuffer readers. Your desktop portal
+configuration and running Emacs session are unchanged.

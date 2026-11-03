@@ -22,11 +22,14 @@
 (require 'dbus)
 (require 'xdg)
 (require 'dired)
+(require 'mailcap)
+(require 'url-util)
 
 ;;; Variables
 ;;;; Keymaps
 (defvar-keymap filechooser-dired-overriding-map
   :doc "Keymap used as `override-global-map' for Dired based file selection."
+  "RET" #'filechooser-dired-return
   "C-c C-c" #'exit-recursive-edit
   "C-c C-k" #'filechooser-abort
   "C-c C-s" #'filechooser-dired-selection-mode
@@ -72,7 +75,7 @@ value is used as the filename."
 If it is nil the selected frame is used instead."
   :type 'boolean)
 
-(defcustom filechooser-filters `(("Directories" filechooser-file-directory-p . t)
+(defcustom filechooser-filters `(("Directories" filechooser-file-directory-p)
                                  ("Elisp files" ,(rx ".el" eos))
                                  ("Not dot files" ,(rx bos (not ?.))))
   "An alist of (NAME FILTER . BOOL).
@@ -122,6 +125,9 @@ UI of choice: usually RET."
   "When filechooser is active, this variable is set to the command being used.")
 
 ;;;; Internal Variables
+(defvar filechooser--request-kind 'file)
+(defvar-local filechooser--picker-buffer nil)
+(defvar filechooser--dired-window nil)
 (defvar filechooser--filters nil)
 (defvar filechooser--active-filters nil)
 (defvar filechooser--multiple-selection nil)
@@ -144,13 +150,13 @@ See Info node `(elisp) Programmed Completion' for CAND and TRANSFORM."
 
 (defun filechooser-file-directory-p (name)
   "Return non-nil if NAME is an existing directory."
-  (file-directory-p (if (derived-mode-p 'dired-mode)
+  (file-directory-p (if (and (derived-mode-p 'dired-mode) (not (file-name-absolute-p name)))
                         (expand-file-name name (dired-current-directory))
                       name)))
 
 (defun filechooser--filters (filters)
   "Return FILTERS added to `filechooser-filters'."
-  (cl-delete-duplicates (append filechooser-filters filters)
+  (cl-delete-duplicates (append (copy-tree filechooser-filters) (copy-tree filters))
                         :test #'equal :key #'car))
 
 (defun filechooser--active-filters ()
@@ -179,38 +185,52 @@ With prefix ARG toggle multiple filters using `completing-read-multiple'."
       (if (minibufferp)
           (throw 'continue t)
         (dolist (buf filechooser--dired-buffers)
-          (with-current-buffer buf (jit-lock-refontify)))))))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf (jit-lock-refontify))))))))
 
 (defun filechooser--make-filters (opts)
-  "Convert globs filters in OPTS to regexps."
+  "Convert portal filters in OPTS to picker filters."
   (let ((filters (caar (alist-get "filters" opts nil nil #'equal)))
         (current (caar (alist-get "current_filter" opts nil nil #'equal)))
-        (regex-filters)
-        (glob-to-regexp (lambda (cell) (if (eq  0 (car cell))
-                                      (wildcard-to-regexp (nth 1 cell))
-                                    ""))))
-    (unless (alist-get (car current) filters nil nil #'equal)
-      (when current (push current filters)))
-    (pcase-dolist (`(,name ,globs) filters)
-      (push (list name (mapconcat glob-to-regexp globs "\\|"))
-            regex-filters))
-    (when (and current (not (caar (alist-get "directory" opts nil nil #'equal))))
-      (cl-callf not (cdr (alist-get (car current) regex-filters nil nil #'equal))))
-    (nreverse regex-filters)))
+        result)
+    (when (and current (not (assoc (car current) filters)))
+      (push current filters))
+    (dolist (filter filters (nreverse result))
+      (let ((rules (cadr filter)))
+        (push (cons (car filter)
+                    (cons (lambda (name)
+                            (let ((case-fold-search nil))
+                              (cl-some
+                               (lambda (rule)
+                                 (pcase (car rule)
+                                   (0 (string-match-p (wildcard-to-regexp (cadr rule))
+                                                      (file-name-nondirectory name)))
+                                   (1 (let ((mime (mailcap-extension-to-mime
+                                                   (or (file-name-extension name) ""))))
+                                        (and mime (string-match-p
+                                                   (wildcard-to-regexp (cadr rule)) mime))))))
+                               rules)))
+                          (equal (car filter) (car current))))
+              result)))))
+
+(defun filechooser--eligible-p (name)
+  "Return non-nil when NAME has the requested kind."
+  (and name (file-exists-p name)
+       (if (eq filechooser--request-kind 'directory)
+           (file-directory-p name)
+         (not (file-directory-p name)))))
 
 (defun filechooser--filters-predicate (name)
-  "Return non-nil if NAME matches an active filter."
-  (if filechooser--active-filters
-      (catch 'match
-        (dolist (filter filechooser--active-filters)
-          (when (cond
-                 ((stringp filter)
-                  (string-match filter name))
-                 ((functionp filter)
-                  (funcall filter name))
-                 ((error "Unknown filter %S" filter)))
-            (throw 'match t))))
-    t))
+  "Return non-nil if NAME is navigable or matches an active filter."
+  (or (filechooser-file-directory-p name)
+      (and (not (eq filechooser--request-kind 'directory))
+           (let ((case-fold-search nil))
+             (or (null filechooser--active-filters)
+                 (cl-some (lambda (filter)
+                            (cond ((stringp filter) (string-match-p filter name))
+                                  ((functionp filter) (funcall filter name))
+                                  (t (error "Unknown filter %S" filter))))
+                          filechooser--active-filters))))))
 
 ;;; Utility definitions
 (defmacro filechooser--maybe-with-new-frame (minibuffer &rest body)
@@ -226,25 +246,32 @@ MINIBUFFER is the value of minibuffer frame paramter."
                                           (minibuffer . ,minibuffer))))
                  (special-event-map filechooser--special-event-map))
              (unwind-protect
-                 (with-demoted-errors "%S"
+                 (catch 'exit
                    (with-selected-frame ,framevar
                      ,@body))
                (delete-frame ,framevar 'force)))
-         (with-demoted-errors "%S"
+         (catch 'exit
            ,@body)))))
 
 (defun filechooser-abort ()
   "Abort the file selection."
   (interactive)
-  (throw 'exit "Error: File selection aborted."))
+  (throw 'exit nil))
 
 (defun filechooser--return-value (filenames &rest entries)
   "Construct return value list of FILENAMES and alist ENTRIES."
   `(,(if filenames 0 1)
     ,(if filenames
          `(:array
-           (:dict-entry "uris" (:variant (:array ,@(mapcar #'xdg-thumb-uri
-                                                           (ensure-list filenames)))))
+           (:dict-entry "uris"
+                        (:variant
+                         (:array ,@(mapcar
+                                    (lambda (name)
+                                      (concat "file://"
+                                              (url-hexify-string
+                                               (encode-coding-string (expand-file-name name) 'utf-8)
+                                               (append url-unreserved-chars '(?/)))))
+                                    (ensure-list filenames)))))
            ,@(mapcar (lambda (cell) `(:dict-entry ,(car cell) (:variant ,(cdr cell))))
                      entries))
        `(:array :signature "{sv}"))))
@@ -314,15 +341,16 @@ If MULTIPLE is non-nil `completing-read-multiple' is used."
   (let* ((result t)
          (filechooser--filters (filechooser--filters filters))
          (filechooser--active-filters (filechooser--active-filters)))
-    (while (eq t result)
+    (while (or (eq t result)
+               (and (eq mustmatch t) result (not (filechooser--eligible-p result))))
       (when (minibufferp nil t)
         (abort-minibuffers))
-      (setq result (filechooser--read-file-name-1 prompt mustmatch dir default)))
-    (when (equal result default)
-      (setq result (expand-file-name default dir)))
-    (when (and default (file-directory-p result))
+      (setq result (filechooser--read-file-name-1 prompt mustmatch dir default))
+      (when (stringp result)
+        (setq result (expand-file-name result dir))))
+    (when (and result default (file-directory-p result))
       (setq result (expand-file-name default result)))
-    (if (or mustmatch (not (file-exists-p result)))
+    (if (or (null result) mustmatch (not (file-exists-p result)))
         result
       (filechooser--handle-exisiting-file result dir filters))))
 
@@ -363,7 +391,8 @@ files which satisfy one of the active filters from FILTERS or
     (cl-callf completion-pcm--filename-try-filter cands)
     (setq filechooser--multiple-selection
           (delete-dups
-           (mapcar (lambda (cand) (cons (expand-file-name cand dir) t)) cands)))
+           (mapcar (lambda (cand) (cons (expand-file-name cand dir) t))
+                   (cl-remove-if-not (lambda (cand) (filechooser--eligible-p (expand-file-name cand dir))) cands))))
     (throw 'done dir)))
 
 (defun filechooser--multiple-read-file-name (prompt &optional dir)
@@ -404,9 +433,10 @@ files which satisfy one of the active filters from FILTERS or
                      (setq selected (expand-file-name
                                      (filechooser--multiple-read-file-name
                                       prompt dir)))
-                     (cl-callf not
-                         (alist-get selected filechooser--multiple-selection
-                                    nil t #'equal))
+                     (when (filechooser--eligible-p selected)
+                       (cl-callf not
+                           (alist-get selected filechooser--multiple-selection
+                                      nil t #'equal)))
                      (when (eq this-command 'filechooser-multiple-continue)
                        (expand-file-name (file-name-directory selected))))))
       (nreverse (mapcar #'car filechooser--multiple-selection)))))
@@ -417,17 +447,26 @@ If `filechooser-use-popup-frame' is non-nil a new minibuffer only popup frame
 is used, othewise the selected frame is used.  PROMPT and DIR are as in
 `read-directory-name'."
   (filechooser--maybe-with-new-frame only
-    (when-let ((save-dir (read-directory-name prompt dir))
-               (names nil))
-      (make-directory save-dir t)
-      (catch 'abort
-        (dolist (file files)
-          (push (if (file-exists-p (expand-file-name file save-dir))
-                    (or (filechooser--handle-exisiting-file file save-dir)
-                        (throw 'abort nil))
-                  (expand-file-name file save-dir))
-                names))
-        names))))
+    (when-let ((save-dir (read-directory-name prompt dir)))
+      (let (names)
+        (make-directory save-dir t)
+        (catch 'abort
+          (dolist (file files)
+            (let ((target (expand-file-name file save-dir)))
+              (when (or (file-exists-p target) (member target names))
+                (if (eq filechooser-save-existing-files 'uniquify)
+                    (let ((n 1) (base (file-name-sans-extension target))
+                          (ext (or (file-name-extension target t) "")))
+                      (while (or (file-exists-p (format "%s-%d%s" base n ext))
+                                 (member (format "%s-%d%s" base n ext) names))
+                        (cl-incf n))
+                      (setq target (format "%s-%d%s" base n ext)))
+                  (setq target (filechooser--handle-exisiting-file target save-dir))
+                  (unless target (throw 'abort nil))
+                  (setq target (expand-file-name target save-dir))
+                  (when (member target names) (throw 'abort nil))))
+              (push target names)))
+          (nreverse names))))))
 
 ;;; Dired based selection
 (define-minor-mode filechooser-dired-selection-mode
@@ -445,18 +484,30 @@ without exiting file selection."
               dired-marker-char))))
 
 (declare-function filechooser--adjust-selection-buffer nil)
+(declare-function filechooser--selection-files nil)
+(declare-function filechooser--reset-selection nil)
+(declare-function filechooser--cancel-selection-timer nil)
 (declare-function filechooser--process-changed-marks nil)
 (declare-function filechooser-dired-clear-selection nil)
 
 (let ((selection (make-hash-table :test #'equal))
       timer)
 
+  (defun filechooser--reset-selection ()
+    (clrhash selection))
+
+  (defun filechooser--selection-files ()
+    (hash-table-keys selection))
+
+  (defun filechooser--cancel-selection-timer ()
+    (when timer (cancel-timer timer) (setq timer nil)))
+
   (defun filechooser--adjust-selection-buffer ()
+    (filechooser--cancel-selection-timer)
     (when (buffer-live-p (cdr filechooser--dired-selection))
       (with-current-buffer (cdr filechooser--dired-selection)
         (setf (cdr dired-directory) (hash-table-keys selection))
-        (revert-buffer)))
-    (setq timer nil))
+        (revert-buffer))))
 
   (defun filechooser-dired-clear-selection (&optional beg end)
     "Remove files from BEG to END from selection."
@@ -483,12 +534,14 @@ without exiting file selection."
   (defun filechooser--process-changed-marks (beg end _length)
     "Deal with change in mark from BEG to END."
     (when (and filechooser-dired-selection-mode
+               filechooser--picker-buffer
                (derived-mode-p 'dired-mode)
                (eq (1+ beg) end))
       (save-excursion
         (goto-char beg)
         (cond
-         ((or (invisible-p (1- (pos-eol)))
+         ((or (not (filechooser--eligible-p (dired-get-filename nil t)))
+              (invisible-p (1- (pos-eol)))
               (not (filechooser--filters-predicate
                     (dired-get-filename 'no-dir t))))
           (dired-unmark nil))
@@ -508,16 +561,27 @@ See `dired-mark' for ARG and INTERACTIVE."
   (interactive (list current-prefix-arg t))
   (filechooser-dired-clear-selection arg interactive))
 
-(defun filechooser--dired-setup-buffer (_)
+(defun filechooser--dired-setup-buffer (&optional _)
   "Setup the current buffer for file selection."
-  (when (and (derived-mode-p 'dired-mode)
+  (when (and (eq (selected-window) filechooser--dired-window)
+             (derived-mode-p 'dired-mode)
              (not (memq (current-buffer)
                         `(,(cdr filechooser--dired-selection)
                           ,@filechooser--dired-buffers))))
+    (setq-local filechooser--picker-buffer t)
     (add-hook 'jit-lock-functions #'filechooser--dired-jit-filter 95 t)
     (jit-lock-mode t)
     (add-to-invisibility-spec 'filechooser-filter)
     (cl-pushnew (current-buffer) filechooser--dired-buffers)))
+
+(defun filechooser-dired-return ()
+  "Navigate directories or accept the file at point."
+  (interactive)
+  (let ((name (dired-get-filename nil t)))
+    (cond ((and name (file-directory-p name))
+           (dired-find-file)
+           (filechooser--dired-setup-buffer))
+          ((filechooser--eligible-p name) (exit-recursive-edit)))))
 
 (defun filechooser-dired (&optional dir filters)
   "Select some files using Dired.
@@ -526,9 +590,13 @@ editing session.  FILTERS are in the format of `filechooser-filters'."
   (unless (and filechooser--dired-selection
                (file-directory-p (car filechooser--dired-selection)))
     (setq filechooser--dired-selection (list (make-temp-file "filechooser-selection-" t))))
-  (let* ((overriding-map `((t . ,filechooser-dired-overriding-map)))
+  (let* ((overriding-map `((filechooser--picker-buffer . ,filechooser-dired-overriding-map)))
          (filechooser--filters (filechooser--filters filters))
          (filechooser--active-filters (filechooser--active-filters))
+         (dired-kill-when-opening-new-dired-buffer nil)
+         (dired-mode-hook (cons #'filechooser--dired-setup-buffer dired-mode-hook))
+         (post-command-hook (cons #'filechooser--dired-setup-buffer post-command-hook))
+         filechooser--dired-window
          filechooser--dired-buffers)
     (save-window-excursion
       (unwind-protect
@@ -553,24 +621,46 @@ editing session.  FILTERS are in the format of `filechooser-filters'."
             (push overriding-map emulation-mode-map-alists)
             (add-hook 'window-buffer-change-functions #'filechooser--dired-setup-buffer)
             (add-hook 'after-change-functions #'filechooser--process-changed-marks)
-            (other-window 1)
-            (dired (or dir default-directory))
+             (other-window 1)
+             (setq filechooser--dired-window (selected-window))
+             (dired (or dir default-directory))
             (filechooser--dired-setup-buffer nil)
             (unless (recursive-edit)
-              (filechooser--adjust-selection-buffer)
-              (with-current-buffer (cdr filechooser--dired-selection)
-                (cdr dired-directory))))
+              (let* ((selected (cl-remove-if-not #'filechooser--eligible-p
+                                                  (filechooser--selection-files)))
+                     (at-point (and (derived-mode-p 'dired-mode)
+                                    (dired-get-filename nil t)))
+                     (fallback (if (and (eq filechooser--request-kind 'directory)
+                                        (not (filechooser--eligible-p at-point)))
+                                   default-directory at-point)))
+                (or selected (and (filechooser--eligible-p fallback) (list fallback))))))
         (cl-callf2 delq overriding-map emulation-mode-map-alists)
-        (filechooser-dired-clear-selection)
+        (filechooser--cancel-selection-timer)
+        (when (buffer-live-p (cdr filechooser--dired-selection))
+          (filechooser--adjust-selection-buffer)
+          (filechooser-dired-clear-selection))
+        (filechooser--cancel-selection-timer)
+        (filechooser--reset-selection)
         (filechooser-dired-selection-mode -1)
         (remove-hook 'window-buffer-change-functions #'filechooser--dired-setup-buffer)
         (remove-hook 'after-change-functions #'filechooser--process-changed-marks)
         (kill-buffer (cdr filechooser--dired-selection))
         (setcdr filechooser--dired-selection nil)
         (dolist (buf filechooser--dired-buffers)
-          (with-current-buffer buf
-            (jit-lock-unregister #'filechooser--dired-jit-filter)
-            (remove-from-invisibility-spec 'filechooser-filter)))))))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (setq-local filechooser--picker-buffer nil)
+              (let ((inhibit-read-only t))
+                (let ((pos (point-min)))
+                  (while (< pos (point-max))
+                    (let ((next (next-single-property-change pos 'invisible nil (point-max))))
+                      (when-let ((value (get-text-property pos 'invisible)))
+                        (put-text-property pos next 'invisible
+                                           (if (listp value) (delq 'filechooser-filter (copy-sequence value))
+                                             (unless (eq value 'filechooser-filter) value))))
+                      (setq pos next)))))
+              (jit-lock-unregister #'filechooser--dired-jit-filter)
+              (remove-from-invisibility-spec 'filechooser-filter))))))))
 
 (defun filechooser--dired-jit-filter (beg end)
   "Hide files that don't match current filters from BEG to END."
@@ -608,40 +698,80 @@ buffer.  FILTERS are used to restrict selection to a subset of files."
   (filechooser--maybe-with-new-frame t (filechooser-dired dir filters)))
 
 ;;; Method handlers
-(defun filechooser-handle-open-file (_handle _app_id _parent title &rest opts)
+(defun filechooser--option-path (opts name)
+  "Decode byte-array option NAME from OPTS."
+  (when-let ((bytes (caar (alist-get name opts nil nil #'equal))))
+    (dbus-byte-array-to-string (if (equal (car (last bytes)) 0) (butlast bytes) bytes))))
+
+(defun filechooser--prompt (action app-id title)
+  "Format ACTION using APP-ID or the application suffix of TITLE."
+  (let* ((safe-id (and (stringp app-id)
+                       (string-match-p "\\`[[:alnum:]_][[:alnum:]_.-]*\\'" app-id)
+                       app-id))
+         (desktop-name
+          (and safe-id
+               (condition-case nil
+                   (let ((file (locate-file (concat safe-id ".desktop")
+                                            (mapcar (lambda (dir) (expand-file-name "applications" dir))
+                                                    (cons (xdg-data-home) (xdg-data-dirs))))))
+                     (when file (gethash "Name" (xdg-desktop-read-file file))))
+                 (error nil))))
+         (desktop-name (and (stringp desktop-name) (string-trim desktop-name)))
+         (suffix (and (stringp title)
+                      (string-match ".*[[:space:]][-–—][[:space:]]+\\([^–—]+\\)\\'" title)
+                      (string-trim (match-string 1 title))))
+         (app (or (and desktop-name (not (string-empty-p desktop-name)) desktop-name)
+                  (and suffix (not (string-empty-p suffix)) suffix)
+                  safe-id)))
+    (concat action (if app (format " [%s]" app) "") ": ")))
+
+(defun filechooser-handle-open-file (_handle app-id _parent title &rest opts)
   "Handle OpenFile request with prompt TITLE and options OPTS."
   (setq opts (or (plist-get opts :array) (car opts)))
-  (let ((filters (filechooser--make-filters opts)))
-    (filechooser--return-value
-     (if (caar (alist-get "multiple" opts nil nil #'equal))
-         (progn
-           (setq filechooser-current-operation filechooser-choose-files)
-           (funcall filechooser-choose-files (format "%s: " title) nil filters))
-       (setq filechooser-current-operation filechooser-choose-file)
-       (funcall filechooser-choose-file (format "%s: " title) nil filters t)))))
+  (let* ((filters (filechooser--make-filters opts))
+         (multiple (caar (alist-get "multiple" opts nil nil #'equal)))
+         (filechooser--request-kind (if (caar (alist-get "directory" opts nil nil #'equal))
+                                       'directory 'file))
+         (dir (filechooser--option-path opts "current_folder"))
+         (dir (and dir (file-name-as-directory dir)))
+         (chooser (if multiple filechooser-choose-files filechooser-choose-file))
+         (prompt (filechooser--prompt (if (eq filechooser--request-kind 'directory)
+                                          "Select folder" "Open file")
+                                      app-id title))
+         (result (progn
+                   (setq filechooser-current-operation chooser)
+                   (if multiple (funcall chooser prompt dir filters)
+                     (funcall chooser prompt dir filters t))))
+         (names (ensure-list result)))
+    (cond ((null result) (filechooser--return-value nil))
+          ((or (not (listp names))
+               (and (not multiple) (/= (length names) 1))
+               (not (cl-every (lambda (name) (and (stringp name) (filechooser--eligible-p name))) names)))
+           '(2 (:array :signature "{sv}")))
+          (t (filechooser--return-value names)))))
 
-(defun filechooser-handle-save-file (_handle _app_id _parent title &rest opts)
+(defun filechooser-handle-save-file (_handle app-id _parent title &rest opts)
   "Handle SaveFile request with prompt TITLE and options OPTS."
   (setq opts (or (plist-get opts :array) (car opts)))
   (setq filechooser-current-operation filechooser-choose-file)
-  (filechooser--return-value
-   (funcall
-    filechooser-choose-file
-    (format "%s: " title)
-    (file-name-as-directory
-     (dbus-byte-array-to-string
-      (butlast (caar (alist-get "current_folder" opts nil nil #'equal)))))
-    (filechooser--make-filters opts) nil
-    (caar (alist-get "current_name" opts nil nil #'equal)))))
+  (let* ((current-file (filechooser--option-path opts "current_file"))
+         (folder (or (filechooser--option-path opts "current_folder")
+                     (and current-file (file-name-directory current-file))))
+         (name (or (caar (alist-get "current_name" opts nil nil #'equal))
+                   (and current-file (file-name-nondirectory current-file)))))
+    (filechooser--return-value
+     (funcall filechooser-choose-file (filechooser--prompt "Save file" app-id title)
+              (and folder (file-name-as-directory folder))
+              (filechooser--make-filters opts) nil name))))
 
-(defun filechooser-handle-save-files (_handle _app_id _parent title &rest opts)
+(defun filechooser-handle-save-files (_handle app-id _parent title &rest opts)
   "Handle SaveFiles request with prompt TITLE and options OPTS."
   (setq opts (or (plist-get opts :array) (car opts)))
   (setq filechooser-current-operation filechooser-choose-directory)
   (filechooser--return-value
    (funcall
     filechooser-choose-directory
-    (format "%s: " title)
+    (filechooser--prompt "Save files" app-id title)
     (dbus-byte-array-to-string
      (butlast (caar (alist-get "current_folder" opts nil nil #'equal))))
     (mapcar (lambda (file) (dbus-byte-array-to-string (butlast file)))
@@ -660,7 +790,14 @@ It works by using d-bus and xdg-desktop-portal and implements
                :session "org.gnu.Emacs.FileChooser"
                "/org/freedesktop/portal/desktop"
                "org.freedesktop.impl.portal.FileChooser"
-               method handler t)))
+               method (lambda (&rest args)
+                        (condition-case err
+                            (apply handler args)
+                          (quit (filechooser--return-value nil))
+                          (error
+                           (message "Filechooser %s failed: %s" method
+                                    (error-message-string err))
+                           '(2 (:array :signature "{sv}"))))) t)))
     (register "OpenFile" 'filechooser-handle-open-file)
     (register "SaveFile" 'filechooser-handle-save-file)
     (register "SaveFiles" 'filechooser-handle-save-files)
